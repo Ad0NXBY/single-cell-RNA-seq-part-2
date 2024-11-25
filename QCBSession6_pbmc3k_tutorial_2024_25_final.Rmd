@@ -1,0 +1,580 @@
+---
+title: "QCB 2022/23 Session 6: Seurat - Guided Clustering Tutorial"
+output:
+  html_document:
+    theme: flatly
+    df_print: kable
+date: 'Compiled: `r format(Sys.Date(), "%B %d, %Y")`'
+---
+
+------------------------------------------------------------------------
+
+```{r setup, include=FALSE}
+all_times <- list()  # store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now, units = "secs")
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 95),
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE
+)
+```
+
+# Tutorial background and dataset information.
+
+This scRNA-seq tutorial is adapted from the Seurat introductory training vignette (Guided tutoral of 2,700 PBMCs: <https://satijalab.org/seurat/articles/pbmc3k_tutorial.html>).
+
+For this tutorial, we will be continuing the analysis of the dataset of Peripheral Blood Mononuclear Cells (PBMC) freely available from 10X Genomics. There are 2,700 single cells that were sequenced on the Illumina NextSeq 500. The raw data from 10x Genomics can be found [here](https://cf.10xgenomics.com/samples/cell/pbmc3k/pbmc3k_filtered_gene_bc_matrices.tar.gz).
+
+In QCB Session 5 we performed the data quality control, Transcript counts normalization (using the Seurat vst method), Feature selection (of highly variable genes) and scaling (mean expression = 0 and variance =1) prior to starting this session with PCA analysis.
+
+In QCB Session 6, we will perform PCA, selecting significant PCs for downstream clustering analysis to identify communities of cells with shared gene expression using a graph-based clustering approach, prior to visualization using the non-linear dimensional reduction technique, UMAP analysis. All of this has been introduced to you in your lecture this morning.
+
+We will then identify the different cell types making up the cluster communities by performing differential gene expression (DEG) analysis. The final steps in your workshop today is to use a list of canonical gene expression marker genes for PBMCs to identify the cell types from the DEG analysis and transfer cell identities to the cell barcodes in the pbmc object.
+
+Additionally, if there is enough time, you will have the option to explore some transcriptional diversity that defines the transition of T lymphocyte cells from one functional subtype to another (i.e. Naive CD4+ to Memory CD4+ T cells).
+
+# Load the required R libraries for this analysis
+
+```{r init}
+#Load R libraries
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+
+```
+
+**Load in the .rds file you have downloaded from blackboard along with this script:**
+
+.rds file: <https://blackboard.soton.ac.uk/bbcswebdav/pid-6859070-dt-content-rid-29605275_1/xid-29605275_1>
+
+.Rmd file <https://blackboard.soton.ac.uk/bbcswebdav/pid-6859070-dt-content-rid-29605290_1/xid-29605290_1>
+
+```{r readdata,message=TRUE}
+# The readRDS function is used to load in .rds objects into your R environment
+pbmc <- readRDS(file = "pbmc3k_QCB_Session5.rds")
+```
+
+# Creating additional QC metrics to visualise today.
+
+Amount of Ribosomal Genes
+
+Ribosomal genes also tend to be very highly represented, and can vary between cell types, so it can be instructive to see how prevalent they are in the data. These are ribosomal protein genes rather than the actual rRNA, so they're more a measure of the translational activity of the cell rather than the cleanliness of the polyA selection.
+
+```{r create QC,message=TRUE}
+#This function calculates the percentage ribosomal content of the RNA for each cell barcode, similar to calculating percentage mitochrondial content in QCB Session 5. This new variable is saved into the pbmc@meta.data slot.
+pbmc@meta.data$pt.Ribosomal <- PercentageFeatureSet(pbmc,pattern="^RP[LS]") #Find out about regular expression use in R to understand the utility of "^RP[LS]"
+
+```
+
+# Creating additional QC metrics to visualise today.
+
+Percentage of Largest Gene
+
+We can also go into the count matrix and make our own metrics. The data is stored in a "Sparse Matrix" which is more efficient for storing data with a large proportion of unobserved values (such as 10X data).
+
+In this example, we run apply over the columns (cells) and calculate what percentage of the data comes from the single most observed gene. Again, having a high proportion of your data dominated by a single gene is a metric which could either give biological context (you will explore this when you visualize the PCA plots) or indicate a technical problem, depending on what the gene is.
+
+When we calculate this we normally find that MALAT1 is normally the largest gene by some distance - it's a non-coding nuclear gene expressed at very high levels. This has such a big effect that we'll measure it separately, and exclude it from our analysis here.
+
+We will get:
+
+-The count for the largest gene per cell -The index position of the gene with the largest count -The name of the most highly expressed gene per cell
+
+```{r create QC2,message=TRUE}
+#The code below calculates the largest gene and its percentage and will be stashed into pbmc@meta.data.
+pbmc.nomalat <- pbmc[rownames(pbmc) != "MALAT1",] 
+pbmc.nomalat$largest_count <- apply(pbmc.nomalat@assays$RNA@counts,2,max)
+pbmc.nomalat$largest_index <- apply(pbmc.nomalat@assays$RNA@counts,2,which.max) 
+pbmc.nomalat$largest_gene <- rownames(pbmc.nomalat)[pbmc.nomalat$largest_index]
+pbmc.nomalat$percent.Largest.Gene <- 100 * pbmc.nomalat$largest_count / pbmc.nomalat$nCount_RNA
+pbmc@meta.data$largest_gene <- pbmc.nomalat$largest_gene 
+pbmc@meta.data$percent.Largest.Gene <- pbmc.nomalat$percent.Largest.Gene
+
+# Clean up and deleted pbmc.nomalat
+rm(pbmc.nomalat)
+```
+
+```{r viz QC,message=TRUE}
+# Visualize the new QC metrics you have created today
+VlnPlot(pbmc, features=c("pt.Ribosomal","percent.Largest.Gene"))
+```
+
+**QCB workshop Question 13** - Run the code chunk below and record the gene symbol and full gene name of the top largest gene in the l.gene.sorted data frame here:
+
+```{r explore QC,message=TRUE}
+#Explotation of the largest gene and its percentages across cell barcodes
+l.genes <- as.data.frame(cbind(as.numeric(pbmc@meta.data$percent.Largest.Gene),pbmc@meta.data$largest_gene))
+l.genes.sorted <- l.genes[order(l.genes$V1,decreasing = T),]
+```
+
+```{r}
+#Record your answers here
+```
+
+</details>
+
+\
+\*\*\*
+
+# Perform linear dimensional reduction
+
+Next we perform PCA on the scaled data. By default, only the previously determined variable features (n=2,000) from QCB Session 5 are used as input, but can be defined using `features` argument if you wish to choose a different subset or all of the genes in the Seurat object. By default the Run PCA function only calculates the first 50 PCs of the data.
+
+```{r pca,results='hide'}
+pbmc <- RunPCA(pbmc, features = VariableFeatures(object = pbmc))
+```
+
+**QCB workshop Question 14** - Explore the pmbc Seurat object and record the locations of all of the pca data in the R chunk below (Hint - use "str(pbmc)" and there are several!)
+
+```{r}
+#Record your answers here
+```
+
+Seurat provides several useful ways of visualizing both cells and features that define the PCA, including `VizDimReduction()`, `DimPlot()`, and `DimHeatmap()`
+
+You will spend some time now exploring them and investigating the relationship between the cell barcodes, PCs and associated genes.
+
+```{r pca_viz1, message=TRUE}
+# Examine and visualize PCA results a few different ways
+print(pbmc[['pca']], dims = 1:5, nfeatures = 5)
+```
+
+**QCB workshop Question 15** - Do you recognise any of the genes associated with the first five PCs? Record your thoughts below:
+
+```{r}
+#Record your answers here
+```
+
+```{r pca_viz2, message=TRUE}
+# Examine and visualize PCA results a few different ways
+VizDimLoadings(pbmc, dims = 1:2, reduction = 'pca')
+```
+
+**QCB workshop Question 16** - What is this plot showing you? (Hint: Type in: ??VizDimLoadings into the Console and hit return to see the R help page) Record your thoughts below:
+
+```{r}
+#Record your answers here
+```
+
+```{r pca_viz3, message=TRUE}
+# Examine and visualize PCA results a few different ways. DimPlot produces a plot of the cell.embeddings for the first two PCs (PC1 and PC2).
+DimPlot(pbmc, reduction = 'pca')
+```
+
+**QCB workshop Question 17** - Do you remember making a plot similar to this in QCB Session 5?
+
+```{r}
+#Record your answers here
+```
+
+```{r pca_viz4, message=TRUE}
+#We can use the group.by option to colour by any other metadata column, today will will use largest_gene. We can also add labels to the plot. Finally we can add a call to the NoLegend() function to suppress the automatic colour legend which is drawn.
+
+DimPlot(pbmc,reduction="pca", group.by = "largest_gene", label = TRUE, label.size = 3,repel = T) + NoLegend()
+
+DimPlot(pbmc,reduction="pca", label = TRUE, label.size = 3,repel = T) + NoLegend()
+```
+
+**QCB workshop Question 18a** - Do you find the relationship between the cell.embeddings and names of the most highly expressed gene per cell interesting? What do you think the green cells are? (Hint: Google search 'Ferritin' (FTL, FTH1) AND 'immune cells')
+
+```{r}
+#Record your answers here
+```
+
+```{r pca_viz5, message=TRUE}
+# Now examine the next two PCs (PC_3 and PC_4)
+DimPlot(pbmc,reduction="pca", group.by = "largest_gene", label = TRUE, label.size = 2,repel = T,dims = 3:4) + NoLegend()
+
+```
+
+**QCB workshop Question 18b** - Copy the RunPCA code above into the R chunk below and change the PCs (try dim = 5:6 next). What do you see?
+
+```{r}
+#Record your answers here
+```
+
+The PCA plots above, nicely shows us the power, but also the limitations of PCA in that we can see that not all of the useful information is captured in the first two principal components. The question then becomes how far down the set of PCs do we need to go to capture all of the biologically relevant information, prior to clustering and visualization of our data?
+
+We encourage a tiered strategy that use heuristic, visualization and statistical resampling approaches to select the most informative PCs.
+
+Identifying the true dimensionality of a dataset -- can be extremely challenging/uncertain for the user.
+
+We therefore suggest these three approaches to consider.
+
+1.  The first method is a heuristic approach that is commonly used, and can be calculated instantly.
+
+2.  The second method is more supervised, exploring PCs to determine relevant sources of heterogeneity, and could be used in conjunction with GSEA for example.
+
+3.  The third method implements a statistical test based on a random null model, but is time-consuming for large datasets, and may not return a clear PC cutoff.
+
+**#1st method -** Examine variance explained by the PCA analysis, by ranking stdev values for each PC calculated by RunPCA
+
+```{r elbow plot, message=TRUE}
+#Extract the variance (stdev column) captured by each PC (PCs column), examine and plot the data
+PCA_stdev <- as.data.frame(cbind(colnames(pbmc@reductions$pca@feature.loadings),pbmc@reductions$pca@stdev))
+colnames(PCA_stdev) <- c("PCs","stdev")
+
+plot(rownames(PCA_stdev),PCA_stdev$stdev)
+```
+
+**QCB workshop Question 19** - Describe the relationship between the variables in the PCA-stdev plot above:
+
+```{r}
+#Record your answers here
+```
+
+You have made a simple plot called the elbow (scree) plot which simply quantitates the amount of variance captured in the different PCs. To do this using Seurat we use the ElbowPlot function below.
+
+```{r elbow_plot2, fig.height=6, fig.width=10}
+x <- 1/mean(1/as.numeric(PCA_stdev$stdev)) # Calculates the harmonic mean of stdev for the first 50 PCs. We are using this to highlight the 'elbow' in the plot, what other value could you use?
+ElbowPlot(pbmc,ndims = 50) + geom_hline(yintercept = x, color = "grey")
+```
+
+In this example, above, we can observe an 'elbow' around PC9-10 (where the grey line of the stdev harmonic mean line intersects), suggesting that the majority of true signal is captured in the first 10 PCs in this dataset. But you could argue that additional PCs could be considered, maybe up to PC_12...
+
+**#2nd method** - Visualization using Feature Heatmaps ordered according to their PCA scores.
+
+In particular `DimHeatmap()` allows for easy exploration of the primary sources of heterogeneity in a dataset, and can be useful when trying to decide which PCs to include for further downstream analyses. Both cells and features are ordered according to their PCA scores. Setting `cells` to a number plots the 'extreme' cells on both ends of the spectrum, which dramatically speeds plotting for large datasets. Though clearly a supervised analysis, we find this to be a valuable tool for exploring correlated feature sets.
+
+This requires some background biological knowledge of the cell types sequenced. Otherwise, you cannot really supervise this analysis and are just counting the PCs with heatmaps that form a cross-window shape.
+
+```{r single-heatmap}
+#Explore the first PC
+DimHeatmap(pbmc, dims = 1, cells = 500, balanced = TRUE)
+```
+
+```{r multi-heatmap, fig.height=15, fig.width=9}
+#Explore the first 15 PCs
+DimHeatmap(pbmc, dims = 1:15, cells = 500, balanced = TRUE)
+```
+
+**QCB workshop Question 20** - How many cross-window shapes do you see? How many PCs will you select? Do you think the cell type abundance in the dataset impacts these heatmaps in any way?
+
+```{r}
+#record your answers here
+```
+
+**#3rd method** - perform a resampling test (The Jackstraw procedure) - Make sure you read about the JackStraw method here: <https://academic.oup.com/bioinformatics/article/31/4/545/2748186>
+
+Determine the 'dimensionality' of the dataset using a resampling approach:
+
+To overcome the extensive technical noise in any single feature for scRNA-seq data, Seurat clusters cells based on their PCA scores, with each PC essentially representing a 'metafeature' that combines information across a correlated feature set. The top principal components therefore represent a robust compression of the dataset. However, how many components should we choose to include? 10? 20? 100?
+
+In [Macosko *et al*](http://www.cell.com/abstract/S0092-8674(15)00549-8), we implemented a resampling test inspired by the JackStraw procedure. We randomly permute a subset of the data (1% by default) and rerun PCA, constructing a 'null distribution' of feature scores, and repeat this procedure. We identify 'significant' PCs as those who have a strong enrichment of low p-value features.
+
+```{r jackstraw, fig.height=6, fig.width=10}
+# NOTE: This process can take a long time for bigger datasets. More approximate techniques such as those implemented in ElbowPlot() can be used to reduce computation time.
+pbmc <- JackStraw(pbmc, num.replicate = 100)
+pbmc <- ScoreJackStraw(pbmc, dims = 1:20)
+```
+
+The `JackStrawPlot()` function provides a visualization tool for comparing the distribution of p-values for each PC with a uniform distribution (dashed line). 'Significant' PCs will show a strong enrichment of features with low p-values (solid curve above the dashed line). In this case it appears that there is a sharp drop-off in significance after the first 10-12 PCs.
+
+```{r jsplots, fig.height=6, fig.width=10}
+#Plot the results of the JackStraw analysis
+JackStrawPlot(pbmc, dims = 1:15)
+```
+
+**QCB workshop Question 21** - How many PCs and which PCs are significant in the above JackStrawPlot?
+
+```{r}
+#Record your answers here
+```
+
+**QCB workshop Question 22** - Using all three methods above, did you reach a consensus in the number of PCs to select for downstream analysis? Which method was most useful and why?
+
+```{r}
+#Record your answers here
+```
+
+#We are going to all chose 10 PCs for the workshop today, but encourage you to consider the following for your independent learning:
+
+-   We will probably miss some rare cells types using only 10 PCs. But this dataset size is small so we will have a lower confidence in observing them robustly.
+
+-   Dendritic cell and NK aficionados may recognize that genes strongly associated with PCs 12 and 13 define rare immune subsets (i.e. MZB1 is a marker for plasmacytoid DCs). However, these groups are so rare, they are difficult to distinguish from background noise for a dataset of this size without prior knowledge.
+
+-   We encourage users to repeat downstream analyses with a different number of PCs (10, 15, or even 50!). As you will observe, the results often do not differ dramatically.
+
+-   We advise users to err on the higher side when choosing this parameter. For example, performing downstream analyses with only 5 PCs does significantly and adversely affect results.
+
+------------------------------------------------------------------------
+
+**!REMEMBER TO TAKE A BREAK - before clustering your cells!**
+
+------------------------------------------------------------------------
+
+# Cluster the cells
+
+Seurat applies a graph-based clustering approach, building upon initial strategies in ([Macosko *et al*](http://www.cell.com/abstract/S0092-8674(15)00549-8)). Importantly, the *distance metric* which drives the clustering analysis (based on previously identified PCs) remains the same. However, our approach to partitioning the cellular distance matrix into clusters has dramatically improved. Our approach was heavily inspired by recent manuscripts which applied graph-based clustering approaches to scRNA-seq data [[SNN-Cliq, Xu and Su, Bioinformatics, 2015]](http://bioinformatics.oxfordjournals.org/content/early/2015/02/10/bioinformatics.btv088.abstract) and CyTOF data [[PhenoGraph, Levine *et al*., Cell, 2015]](http://www.ncbi.nlm.nih.gov/pubmed/26095251). Briefly, these methods embed cells in a graph structure - for example a K-nearest neighbor (KNN) graph, with edges drawn between cells with similar feature expression patterns, and then attempt to partition this graph into highly interconnected 'quasi-cliques' or 'communities'.
+
+As in PhenoGraph, we first construct a KNN graph based on the euclidean distance in PCA space, and refine the edge weights between any two cells based on the shared overlap in their local neighborhoods (Jaccard similarity). This step is performed using the `FindNeighbors()` function, and takes as input the previously defined dimensionality of the dataset (first 10 PCs).
+
+To cluster the cells, we next apply modularity optimization techniques such as the Louvain algorithm (default) or SLM [[SLM, Blondel *et al*., Journal of Statistical Mechanics]](http://dx.doi.org/10.1088/1742-5468/2008/10/P10008), to iteratively group cells together, with the goal of optimizing the standard modularity function. The `FindClusters()` function implements this procedure, and contains a resolution parameter that sets the 'granularity' of the downstream clustering, with increased values leading to a greater number of clusters.
+
+We find that setting this parameter between 0.4-1.2 typically returns good results for single-cell datasets of around 3K cells. Optimal resolution often increases for larger datasets. The clusters can be found using the `Idents()` function.
+
+```{r cluster1, fig.height=5, fig.width=7}
+#PC_1 to PC_1 used (dims = 1:10)
+#Resolution value set at maximum of 1.2
+pbmc <- FindNeighbors(pbmc, dims = 1:10)
+pbmc <- FindClusters(pbmc, resolution = 1.2)
+
+# Look at cluster IDs of the first 5 cells
+head(Idents(pbmc), 5)
+```
+
+**QCB workshop Question 23** - How many cell clusters do you find with resolution = 1.2?
+
+```{r}
+#Record your answers here
+```
+
+```{r cluster2, fig.height=5, fig.width=7}
+#PC_1 to PC_1 used (dims = 1:10)
+#Resolution value set at minimum of 0.4
+pbmc <- FindNeighbors(pbmc, dims = 1:10)
+pbmc <- FindClusters(pbmc, resolution = 0.4)
+
+# Look at cluster IDs of the first 5 cells
+head(Idents(pbmc), 5)
+```
+
+**QCB workshop Question 24** - How many cell clusters do you find with resolution = 0.4? Which is the best resolution to use and when do you know to stop?
+
+```{r}
+#Record your answers here
+```
+
+------------------------------------------------------------------------
+
+# Run non-linear dimensional reduction (UMAP/tSNE)
+
+Seurat offers several non-linear dimensional reduction techniques, such as tSNE and UMAP, to visualize and explore these datasets. The goal of these algorithms is to learn the underlying manifold of the data in order to place similar cells together in low-dimensional space. Cells within the graph-based clusters determined above should co-localize on these dimension reduction plots. As input to the UMAP and tSNE, we suggest using the same PCs as input to the clustering analysis.
+
+```{r umap, fig.height=5, fig.width=7}
+# Run UMAP analysis using PC_1 to PC_10 - same as your clustering above. Today we are not going to use the tSNE approach
+pbmc <- RunUMAP(pbmc, dims = 1:10)
+```
+
+```{r umap plot, fig.height=5, fig.width=7}
+# note that you can set `label = TRUE` or use the LabelClusters function to help label individual clusters
+DimPlot(pbmc, reduction = 'umap')
+```
+
+**QCB workshop Question 25** - Describe what you see in the UMAP above? Which clusters are more closely related to each other? Which cluster has the smallest cell number?
+
+```{r}
+#Record your answers here
+```
+
+You can save the object at this point so that it can easily be loaded back in without having to rerun the computationally intensive steps performed above, or easily shared with collaborators.
+
+```{r saveobject, eval=FALSE}
+saveRDS(pbmc, file = "pbmc3k_QCB_Session6.rds")
+```
+
+------------------------------------------------------------------------
+
+# Finding differential expressed features (cluster biomarkers)
+
+Seurat can help you find markers that define clusters via differential expression. By default, it identifies positive and negative markers of a single cluster (specified in `ident.1`), compared to all other cells. `FindAllMarkers()` automates this process for all clusters, but you can also test groups of clusters vs. each other, or against all cells.
+
+The `min.pct` argument requires a feature to be detected at a minimum percentage in either of the two groups of cells, and the thresh.test argument requires a feature to be differentially expressed (on average) by some amount between the two groups. You can set both of these to 0, but with a dramatic increase in time - since this will test a large number of features that are unlikely to be highly discriminatory.
+
+As another option to speed up these computations, `max.cells.per.ident` can be set. This will downsample each identity class to have no more cells than whatever this is set to. While there is generally going to be a loss in power, the speed increases can be significant and the most highly differentially expressed features will likely still rise to the top.
+
+```{r markers1, fig.height=8, fig.width=15}
+# Find all markers of cluster 1
+cluster1.markers <- FindMarkers(pbmc, ident.1 = 1, min.pct = 0.25)
+head(cluster1.markers, n = 5)
+```
+
+**QCB workshop Question 26** - What is the default statistical inference test for the FindMarkers() function. (Hint: Type '??Findmarkers()' into console and hit return)
+
+```{r}
+#Record your answers here
+```
+
+```{r markers2, fig.height=8, fig.width=15}
+# find all markers distinguishing cluster 5 from clusters 0 and 3
+cluster5.markers <- FindMarkers(pbmc, ident.1 = 5, ident.2 = c(0, 3), min.pct = 0.25)
+#Explore the top markers of cluster 5 from clusters 0 and 3
+head(cluster5.markers, n = 5)
+```
+
+```{r markers3, fig.height=8, fig.width=15}
+#find markers for every cluster compared to all remaining cells, report only the positive ones (only.pos = TRUE)
+pbmc.markers <- FindAllMarkers(pbmc, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+```
+
+**QCB workshop Question 27** - What do all the columns mean in pbmc.markers?
+
+```{r}
+#Record your answers here
+```
+
+```{r markers4, fig.height=8, fig.width=15}
+#Print out the top two markers for each cluster
+pbmc.markers %>% group_by(cluster) %>% top_n(n = 2, wt = avg_log2FC)
+```
+
+Seurat has several tests for differential expression which can be set with the test.use parameter (see the Seurat [DE vignette](de_vignette.html) for details). For example, the ROC test returns the 'classification power' for any individual marker (ranging from 0 - random, to 1 - perfect).
+
+```{r markersroc, fig.height=8, fig.width=15}
+# Perform a ROC analysis for cluster 1 cells
+cluster1.markers <- FindMarkers(pbmc, ident.1 = 1, logfc.threshold = 0.25, test.use = "roc", only.pos = TRUE)
+```
+
+**QCB workshop Question 28** - Define a ROC analysis? Do any of the marker genes for cluster 1 differ between cluster1.markers (ROC) and pbmc.markers (Wilcox)? Why could this be?
+
+```{r}
+#Record your answers here
+```
+
+# Finding differential expressed features (cluster biomarkers) and data exploration/ visualization
+
+We include several tools for visualizing marker expression. `VlnPlot()` (shows expression probability distributions across clusters), and `FeaturePlot()` (visualizes feature expression on a tSNE or PCA plot) are our most commonly used visualizations. We also suggest exploring `RidgePlot()`, `CellScatter()`, and `DotPlot()` as additional methods to view your dataset.
+
+```{r markerplots1, fig.height=10, fig.width=15}
+#Visualize marker gene expression (using normalized gene expression values)
+VlnPlot(pbmc, features = c("MS4A1", "CD79A"))
+```
+
+```{r markerplots2, fig.height=10, fig.width=15}
+# you can plot raw counts as well
+VlnPlot(pbmc, features = c("MS4A1", "CD79A"), slot = 'counts', log = TRUE)
+```
+
+```{r markerplots3, fig.height=10, fig.width=15}
+#Explore gene expression counts in FeaturePlots constructed from the UMAP co-ordinates for each cell.embedding
+FeaturePlot(pbmc, features = c("MS4A1", "GNLY", "CD3E", "CD14", "FCER1A", "FCGR3A", "LYZ", "PPBP", "CD8A"),slot = "count")
+```
+
+`DoHeatmap()` generates an expression heatmap for given cells and features. In this case, we are plotting the top 10 markers for each cluster.
+
+```{r clusterHeatmap, fig.height=8, fig.width=15}
+#Find top 10 marker genes for each cluster (ordered by avg_log2FC)
+pbmc.markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC) -> top10
+
+#Display them in a Heatmap of scaled gene expression
+DoHeatmap(pbmc, features = top10$gene,slot = "scale.data") + NoLegend()
+```
+
+**QCB workshop Question 29** - Is there any biological significance to the checkerboard pattern in the Heatmap above?
+
+```{r}
+#Record your answers here
+```
+
+------------------------------------------------------------------------
+
+# Assigning cell type identity to clusters
+
+Fortunately in the case of this pbmc dataset, we can use canonical gene expression markers to easily match the unbiased clustering to known cell types:
+
+| Cluster ID | Markers       | Cell Type    |
+|------------|---------------|--------------|
+| 0          | IL7R, CCR7    | Naive CD4+ T |
+| 1          | CD14, LYZ     | CD14+ Mono   |
+| 2          | IL7R, S100A4  | Memory CD4+  |
+| 3          | MS4A1         | B            |
+| 4          | CD8A          | CD8+ T       |
+| 5          | FCGR3A, MS4A7 | FCGR3A+ Mono |
+| 6          | GNLY, NKG7    | NK           |
+| 7          | FCER1A, CST3  | DC           |
+| 8          | PPBP          | Platelet     |
+
+```{r labelplot1, fig.height=5, fig.width=9}
+#Renaming clusters and assigning cell identity
+new.cluster.ids <- c("Naive CD4 T", "CD14+ Mono", "Memory CD4 T", "B", "CD8 T", "FCGR3A+ Mono", "NK", "DC", "Platelet")
+names(new.cluster.ids) <- levels(pbmc)
+pbmc <- RenameIdents(pbmc, new.cluster.ids)
+#Save new.cluster.lds to pbmc@meta.data
+pbmc@meta.data$cell.type <- Idents(pbmc)
+```
+
+```{r labelplot2, fig.height=5, fig.width=9}
+#Plot UMAP with cell identity labels
+DimPlot(pbmc, reduction = 'umap', label = TRUE, pt.size = 0.5) + NoLegend()
+```
+
+```{r labelplot3}
+#Further data exploration - The relationship between naive T cells and ribosomal percentage
+p1 <- DimPlot(pbmc, reduction = 'umap', label = TRUE, pt.size = 0.5) + NoLegend()
+p2 <- FeaturePlot(pbmc, features = c("pt.Ribosomal"),min.cutoff = "q10",max.cutoff = "q90")
+p3 <- VlnPlot(pbmc, features=c("pt.Ribosomal"),group.by = "cell.type") + NoLegend()
+#View the 3 plots together
+p1+p2+p3
+```
+
+**QCB workshop Question 30** - What genes marker the Naive T cell cluster? Read the following study: <https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7610365/>. Should pt.Ribsomal QC metric be considered as a confounding variable in our dataset or not?
+
+```{r}
+#Record your answers here
+```
+
+#Further data exploration - Exploring T cell heterogeneity and validating cell identity using a-priori knowledge
+
+```{r markers5}
+#What genes discriminate Naive vs. memory CD4 T cells in our data?
+tcell.markers <- FindMarkers(object = pbmc, ident.1 = "Naive CD4 T", ident.2 = "Memory CD4 T")
+```
+
+Examine the positive and negative markers in tcell.markers
+
+Most of the markers tend to be expressed in Memory CD4 T (i.e. S100A4: <https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4693724/>). However, we can see that CCR7 (<https://journals.aai.org/jimmunol/article/181/11/7681/38492/Dynamic-Modulation-of-CCR7-Expression-and-Function>) is upregulated in Naive CD4 T, strongly indicating that we can differentiate memory from naive CD4 cells, irrespective of the higher ribosomal gene content of Naive CD4 T cells. This can be visualized in the FeaturePlot below.
+
+```{r markerplots4, fig.height=10, fig.width=15}
+#S100A4 and CCR7 expression discriminates CD4 T cell subsets
+FeaturePlot(pbmc, features = c("S100A4","CCR7"),cols = c("gold","black"),order = F)
+```
+
+```{r save.img, include=FALSE}
+#Use ggplot and ggsave to save  a publication quality image of the UMAP in your working directory
+plot <- DimPlot(pbmc, reduction = "umap", label = TRUE, label.size = 4.5) + xlab("UMAP 1") + ylab("UMAP 2") + 
+  theme(axis.title = element_text(size = 18), legend.text = element_text(size = 18)) + 
+  guides(colour = guide_legend(override.aes = list(size = 10)))
+ggsave(filename = "pbmc3k_umap.jpg", height = 7, width = 12, plot = plot, quality = 50)
+```
+
+**QCB workshop Question 31** - How can you save a copy of your marker gene lists? (Hint: use write.csv())
+
+```{r writeoutDGEs}
+#Record your answer here
+```
+
+```{r save.rds, eval=FALSE}
+#Save your final dataset as an .rds file to your working directory
+saveRDS(pbmc, file = "pbmc3k_QCB_Session6_final.rds")
+```
+
+Congratulations Quantitative Cell Biologists! - You have reached the end of your taught QCB Sessions. The QCB module team is looking forward to welcoming you all to the final QCB Session 7 next Monday. Here all instructors (Rosann, Chris and Mat) will be available to recap the syllabus and set the QCB module assignments.
+
+Please use this protected time to start to think about your data analysis strategy and run your thoughts/ plans by the instructors before you make a start in R.
+
+######################## 
+
+**##END OF QCB SESSION 6## \########################**
+
+<details>
+
+<summary>**Session Info**</summary>
+
+```{r}
+sessionInfo()
+```
+
+</details>
